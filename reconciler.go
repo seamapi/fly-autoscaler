@@ -158,7 +158,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	)
 
 	// Determine if we need to create or destroy machines.
-	createdN := len(machines)
+	createdN := len(filtered)
 	if hasMinCreatedN && createdN < minCreatedN {
 		if len(machines) == 0 {
 			return fmt.Errorf("no machine available to clone for scale up")

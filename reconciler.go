@@ -139,7 +139,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	m := machinesByState(filtered)
 
 	// Log out stats so we know exactly what the state of the world is.
-	slog.Info("reconciling",
+	logAttrs := []any{
 		slog.String("app", r.AppName),
 		slog.Group("current",
 			slog.Int("started", len(m[fly.MachineStateStarted])),
@@ -155,7 +155,18 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 				slog.Int("max", maxStartedN),
 			),
 		),
-	)
+	}
+
+	// Add metrics if available
+	if len(r.metrics) > 0 {
+		metricsGroup := make([]any, 0, len(r.metrics)*2)
+		for name, value := range r.metrics {
+			metricsGroup = append(metricsGroup, slog.Float64(name, value))
+		}
+		logAttrs = append(logAttrs, slog.Group("metrics", metricsGroup...))
+	}
+
+	slog.Info("reconciling", logAttrs...)
 
 	// Determine if we need to create or destroy machines.
 	createdN := len(filtered)

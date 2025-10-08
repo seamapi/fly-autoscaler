@@ -254,9 +254,58 @@ func TestReconciler_Scale_Create(t *testing.T) {
 
 		r := fas.NewReconciler()
 		r.Client = &client
+		r.ProcessGroup = "app"
 		r.MinCreatedMachineN = "1"
-		if err := r.Reconcile(context.Background()); err == nil || err.Error() != `no machine available to clone for scale up` {
+		if err := r.Reconcile(context.Background()); err == nil || err.Error() != `no machine available to clone for scale up in process group "app"` {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	// Ensure that machines from the correct process group are used for cloning
+	t.Run("ProcessGroupFiltering", func(t *testing.T) {
+		var client mock.FlapsClient
+		client.ListFunc = func(ctx context.Context, state string) ([]*fly.Machine, error) {
+			return []*fly.Machine{
+				{
+					ID:         "1",
+					State:      fly.MachineStateStarted,
+					Region:     "iad",
+					HostStatus: fly.HostStatusOk,
+					Config: &fly.MachineConfig{
+						Metadata: map[string]string{
+							"fly_process_group": "web",
+							"group":             "web",
+						},
+					},
+				},
+				{
+					ID:         "2",
+					State:      fly.MachineStateStarted,
+					Region:     "den",
+					HostStatus: fly.HostStatusOk,
+					Config: &fly.MachineConfig{
+						Metadata: map[string]string{
+							"fly_process_group": "worker",
+							"group":             "worker",
+						},
+					},
+				},
+			}, nil
+		}
+		client.LaunchFunc = func(ctx context.Context, input fly.LaunchMachineInput) (*fly.Machine, error) {
+			// Verify that we're cloning from the worker machine (ID: 2), not the web machine
+			if got, want := input.Config.Metadata["group"], "worker"; got != want {
+				t.Fatalf("cloning from wrong process group: got metadata=%v, want %v", got, want)
+			}
+			return &fly.Machine{ID: "3", Region: input.Region}, nil
+		}
+
+		r := fas.NewReconciler()
+		r.Client = &client
+		r.ProcessGroup = "worker"
+		r.MinCreatedMachineN = "2"
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatal(err)
 		}
 	})
 }

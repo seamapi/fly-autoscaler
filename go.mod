@@ -3,7 +3,7 @@ module github.com/superfly/fly-autoscaler
 go 1.22.0
 
 require (
-	github.com/expr-lang/expr v1.16.0
+	github.com/expr-lang/expr v1.17.7
 	github.com/prometheus/client_golang v1.18.0
 	github.com/prometheus/common v0.45.0
 	github.com/superfly/fly-go v0.1.36

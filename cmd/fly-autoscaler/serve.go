@@ -78,6 +78,7 @@ func (c *ServeCommand) Run(ctx context.Context, args []string) (err error) {
 		r.InitialMachineState = c.Config.InitialMachineState
 		r.Regions = c.Config.Regions
 		r.ProcessGroup = c.Config.ProcessGroup
+		r.ScaleDownCooldown = c.Config.ScaleDownCooldown
 		r.Collectors = collectors
 		return r
 	}
@@ -92,6 +93,7 @@ func (c *ServeCommand) Run(ctx context.Context, args []string) (err error) {
 	attrs := []any{
 		slog.String("interval", p.ReconcileInterval.String()),
 		slog.String("timeout", p.ReconcileTimeout.String()),
+		slog.String("scaleDownCooldown", c.Config.ScaleDownCooldown.String()),
 		slog.String("appListRefreshInterval", p.AppListRefreshInterval.String()),
 		slog.Int("collectors", len(collectors)),
 	}

@@ -129,6 +129,7 @@ type Config struct {
 	Concurrency            int           `yaml:"concurrency"`
 	Interval               time.Duration `yaml:"interval"`
 	Timeout                time.Duration `yaml:"timeout"`
+	ScaleDownCooldown      time.Duration `yaml:"scale-down-cooldown"`
 	AppListRefreshInterval time.Duration `yaml:"app-list-refresh-interval"`
 	APIToken               string        `yaml:"api-token"`
 	Verbose                bool          `yaml:"verbose"`
@@ -185,6 +186,11 @@ func NewConfigFromEnv() (_ *Config, err error) {
 	if s := os.Getenv("FAS_TIMEOUT"); s != "" {
 		if c.Timeout, err = time.ParseDuration(s); err != nil {
 			return nil, fmt.Errorf("cannot parse FAS_TIMEOUT as duration: %q", s)
+		}
+	}
+	if s := os.Getenv("FAS_SCALE_DOWN_COOLDOWN"); s != "" {
+		if c.ScaleDownCooldown, err = time.ParseDuration(s); err != nil {
+			return nil, fmt.Errorf("cannot parse FAS_SCALE_DOWN_COOLDOWN as duration: %q", s)
 		}
 	}
 	if s := os.Getenv("FAS_APP_LIST_REFRESH_INTERVAL"); s != "" {

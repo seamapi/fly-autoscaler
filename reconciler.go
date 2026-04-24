@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"math"
 	"sort"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/expr-lang/expr"
 	"github.com/superfly/fly-go"
@@ -46,6 +48,22 @@ type Reconciler struct {
 	// Initial machine state (started or stopped)
 	InitialMachineState string
 
+	// Stabilization window for scale-down. When set, downscale actions
+	// (destroy/stop) only fire if the raw target has stayed below the current
+	// machine count for this entire duration. Scale-up is unaffected.
+	// Zero disables the window and restores pre-cooldown behavior.
+	ScaleDownCooldown time.Duration
+
+	// targetHistory holds recent raw max-target samples used to implement the
+	// scale-down stabilization window. Appended to on every reconcile that
+	// successfully computed a max value; pruned to entries within
+	// ScaleDownCooldown.
+	targetHistoryMu sync.Mutex
+	targetHistory   []targetSample
+
+	// Injectable clock for tests. nil means use time.Now.
+	NowFunc func() time.Time
+
 	// List of collectors to fetch metric values from.
 	Collectors []MetricCollector
 
@@ -53,11 +71,83 @@ type Reconciler struct {
 	Stats *ReconcilerStats
 }
 
+type targetSample struct {
+	t          time.Time
+	maxCreated int
+	maxStarted int
+}
+
 func NewReconciler() *Reconciler {
 	return &Reconciler{
 		metrics: make(map[string]float64),
 		Stats:   &ReconcilerStats{},
 	}
+}
+
+func (r *Reconciler) now() time.Time {
+	if r.NowFunc != nil {
+		return r.NowFunc()
+	}
+	return time.Now()
+}
+
+// recordTargetSample appends the current raw max targets to the rolling
+// history window and trims any entries older than ScaleDownCooldown.
+func (r *Reconciler) recordTargetSample(maxCreated, maxStarted int) {
+	if r.ScaleDownCooldown <= 0 {
+		return
+	}
+	now := r.now()
+	cutoff := now.Add(-r.ScaleDownCooldown)
+
+	r.targetHistoryMu.Lock()
+	defer r.targetHistoryMu.Unlock()
+
+	r.targetHistory = append(r.targetHistory, targetSample{t: now, maxCreated: maxCreated, maxStarted: maxStarted})
+
+	// Drop samples older than the window.
+	i := 0
+	for ; i < len(r.targetHistory); i++ {
+		if !r.targetHistory[i].t.Before(cutoff) {
+			break
+		}
+	}
+	if i > 0 {
+		r.targetHistory = append(r.targetHistory[:0], r.targetHistory[i:]...)
+	}
+}
+
+// peakWindow returns the highest maxCreated and maxStarted observed within
+// the cooldown window, and the age of the oldest sample still in the window.
+// If the window is empty (or cooldown is disabled), it returns the raw inputs
+// and zero age.
+func (r *Reconciler) peakWindow(rawMaxCreated, rawMaxStarted int) (int, int, time.Duration) {
+	if r.ScaleDownCooldown <= 0 {
+		return rawMaxCreated, rawMaxStarted, 0
+	}
+
+	r.targetHistoryMu.Lock()
+	defer r.targetHistoryMu.Unlock()
+
+	peakCreated, peakStarted := rawMaxCreated, rawMaxStarted
+	var oldest time.Time
+	for _, s := range r.targetHistory {
+		if s.maxCreated > peakCreated {
+			peakCreated = s.maxCreated
+		}
+		if s.maxStarted > peakStarted {
+			peakStarted = s.maxStarted
+		}
+		if oldest.IsZero() || s.t.Before(oldest) {
+			oldest = s.t
+		}
+	}
+
+	var age time.Duration
+	if !oldest.IsZero() {
+		age = r.now().Sub(oldest)
+	}
+	return peakCreated, peakStarted, age
 }
 
 // NextRegion returns the next region to launch a machine in.
@@ -168,6 +258,15 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 	slog.Info("reconciling", logAttrs...)
 
+	// Record the raw max targets into the rolling stabilization window and
+	// compute the stabilized (peak-held) values used only for scale-down
+	// decisions. Scale-up paths below continue to use the raw min/max values
+	// so upscaling remains immediate.
+	if hasMaxCreatedN || hasMaxStartedN {
+		r.recordTargetSample(maxCreatedN, maxStartedN)
+	}
+	stabilizedMaxCreatedN, stabilizedMaxStartedN, windowAge := r.peakWindow(maxCreatedN, maxStartedN)
+
 	// Determine if we need to create or destroy machines.
 	createdN := len(filtered)
 	if hasMinCreatedN && createdN < minCreatedN {
@@ -180,8 +279,18 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		config.Image = machine.FullImageRef()
 		return r.createN(ctx, filtered[0].Config, machine.Region, minCreatedN-createdN)
 	}
-	if hasMaxCreatedN && createdN > maxCreatedN {
-		return r.destroyN(ctx, m, createdN-maxCreatedN)
+	if hasMaxCreatedN && createdN > stabilizedMaxCreatedN {
+		return r.destroyN(ctx, m, createdN-stabilizedMaxCreatedN)
+	}
+	if hasMaxCreatedN && createdN > maxCreatedN && r.ScaleDownCooldown > 0 {
+		slog.Info("scale-down deferred by cooldown",
+			slog.String("app", r.AppName),
+			slog.String("kind", "destroy"),
+			slog.Int("current", createdN),
+			slog.Int("raw_max", maxCreatedN),
+			slog.Int("stabilized_max", stabilizedMaxCreatedN),
+			slog.Duration("cooldown_remaining", r.ScaleDownCooldown-windowAge),
+		)
 	}
 
 	// Determine if we need to start/stop machines.
@@ -189,8 +298,18 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if hasMinStartedN && startedN < minStartedN {
 		return r.startN(ctx, m[fly.MachineStateStopped], minStartedN-startedN)
 	}
-	if hasMaxStartedN && startedN > maxStartedN {
-		return r.stopN(ctx, m[fly.MachineStateStarted], startedN-maxStartedN)
+	if hasMaxStartedN && startedN > stabilizedMaxStartedN {
+		return r.stopN(ctx, m[fly.MachineStateStarted], startedN-stabilizedMaxStartedN)
+	}
+	if hasMaxStartedN && startedN > maxStartedN && r.ScaleDownCooldown > 0 {
+		slog.Info("scale-down deferred by cooldown",
+			slog.String("app", r.AppName),
+			slog.String("kind", "stop"),
+			slog.Int("current", startedN),
+			slog.Int("raw_max", maxStartedN),
+			slog.Int("stabilized_max", stabilizedMaxStartedN),
+			slog.Duration("cooldown_remaining", r.ScaleDownCooldown-windowAge),
+		)
 	}
 
 	r.Stats.NoScale.Add(1)

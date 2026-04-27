@@ -58,8 +58,13 @@ type Reconciler struct {
 	// scale-down stabilization window. Appended to on every reconcile that
 	// successfully computed a max value; pruned to entries within
 	// ScaleDownCooldown.
+	//
+	// Keyed by AppName so a single Reconciler reused across apps (wildcard
+	// pool mode) keeps each app's cooldown window independent. Without this,
+	// app A's high peak would suppress scale-down for an unrelated app B that
+	// happens to share the worker.
 	targetHistoryMu sync.Mutex
-	targetHistory   []targetSample
+	targetHistory   map[string][]targetSample
 
 	// Injectable clock for tests. nil means use time.Now.
 	NowFunc func() time.Time
@@ -92,7 +97,9 @@ func (r *Reconciler) now() time.Time {
 }
 
 // recordTargetSample appends the current raw max targets to the rolling
-// history window and trims any entries older than ScaleDownCooldown.
+// history window for r.AppName and trims any entries older than
+// ScaleDownCooldown. History is per-app because a single Reconciler is
+// reused across apps in wildcard pool mode.
 func (r *Reconciler) recordTargetSample(maxCreated, maxStarted int) {
 	if r.ScaleDownCooldown <= 0 {
 		return
@@ -103,24 +110,32 @@ func (r *Reconciler) recordTargetSample(maxCreated, maxStarted int) {
 	r.targetHistoryMu.Lock()
 	defer r.targetHistoryMu.Unlock()
 
-	r.targetHistory = append(r.targetHistory, targetSample{t: now, maxCreated: maxCreated, maxStarted: maxStarted})
+	if r.targetHistory == nil {
+		r.targetHistory = make(map[string][]targetSample)
+	}
+	samples := append(r.targetHistory[r.AppName], targetSample{t: now, maxCreated: maxCreated, maxStarted: maxStarted})
 
 	// Drop samples older than the window.
 	i := 0
-	for ; i < len(r.targetHistory); i++ {
-		if !r.targetHistory[i].t.Before(cutoff) {
+	for ; i < len(samples); i++ {
+		if !samples[i].t.Before(cutoff) {
 			break
 		}
 	}
 	if i > 0 {
-		r.targetHistory = append(r.targetHistory[:0], r.targetHistory[i:]...)
+		samples = append(samples[:0], samples[i:]...)
+	}
+	if len(samples) == 0 {
+		delete(r.targetHistory, r.AppName)
+	} else {
+		r.targetHistory[r.AppName] = samples
 	}
 }
 
-// peakWindow returns the highest maxCreated and maxStarted observed within
-// the cooldown window, and the age of the oldest sample still in the window.
-// If the window is empty (or cooldown is disabled), it returns the raw inputs
-// and zero age.
+// peakWindow returns the highest maxCreated and maxStarted observed for
+// r.AppName within the cooldown window, and the age of the oldest sample
+// still in the window. If the window is empty (or cooldown is disabled), it
+// returns the raw inputs and zero age.
 func (r *Reconciler) peakWindow(rawMaxCreated, rawMaxStarted int) (int, int, time.Duration) {
 	if r.ScaleDownCooldown <= 0 {
 		return rawMaxCreated, rawMaxStarted, 0
@@ -131,7 +146,7 @@ func (r *Reconciler) peakWindow(rawMaxCreated, rawMaxStarted int) (int, int, tim
 
 	peakCreated, peakStarted := rawMaxCreated, rawMaxStarted
 	var oldest time.Time
-	for _, s := range r.targetHistory {
+	for _, s := range r.targetHistory[r.AppName] {
 		if s.maxCreated > peakCreated {
 			peakCreated = s.maxCreated
 		}

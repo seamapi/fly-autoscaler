@@ -631,3 +631,53 @@ func TestReconciler_ScaleDownCooldown(t *testing.T) {
 		t.Fatalf("expected immediate scale-up despite cooldown, got created=%d", created)
 	}
 }
+
+// In wildcard pool mode the same Reconciler is reused across apps, with
+// AppName rotated per work-queue item. Each app must keep its own cooldown
+// history; otherwise app A's recent peak can suppress app B's downscale.
+func TestReconciler_ScaleDownCooldown_MultiAppIsolation(t *testing.T) {
+	cooldown := 5 * time.Minute
+
+	machineConfig := &fly.MachineConfig{}
+	// Both apps report 4 started machines.
+	listFour := func(ctx context.Context, state string) ([]*fly.Machine, error) {
+		return []*fly.Machine{
+			{ID: "1", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "2", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "3", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "4", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+		}, nil
+	}
+
+	var client mock.FlapsClient
+	var destroyedB int
+	client.ListFunc = listFour
+	client.DestroyFunc = func(ctx context.Context, input fly.RemoveMachineInput, nonce string) error {
+		destroyedB++
+		return nil
+	}
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r := fas.NewReconciler()
+	r.Client = &client
+	r.ScaleDownCooldown = cooldown
+	r.NowFunc = func() time.Time { return now }
+
+	// App A reconciles with high demand → seeds its own history with peak=4.
+	r.AppName = "app-a"
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "0", "4"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// App B reconciles with low demand and a fleet of 4 → would-destroy 2.
+	// App A's peak must NOT defer App B's destroy.
+	r.AppName = "app-b"
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "0", "2"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if destroyedB != 2 {
+		t.Fatalf("expected app-b destroys to fire independently of app-a peak, got destroyedB=%d", destroyedB)
+	}
+}

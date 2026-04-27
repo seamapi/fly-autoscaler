@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 
 	fas "github.com/superfly/fly-autoscaler"
 	"github.com/superfly/fly-autoscaler/mock"
@@ -543,4 +544,140 @@ func machineCountByState(a []*fly.Machine, state string) (n int) {
 		}
 	}
 	return n
+}
+
+// Exercise the scale-down stabilization window: with a non-zero
+// ScaleDownCooldown, a downscale is deferred until the high watermark in the
+// window has aged out. Scale-up is unaffected.
+func TestReconciler_ScaleDownCooldown(t *testing.T) {
+	cooldown := 5 * time.Minute
+
+	// We simulate 4 created "app" machines. Target max starts at 4 (no
+	// scale-down), then drops to 2 (would destroy 2). Within cooldown, the
+	// destroy must be skipped. After the clock advances past cooldown, it
+	// must fire.
+	machineConfig := &fly.MachineConfig{}
+	listMachines := func() ([]*fly.Machine, error) {
+		return []*fly.Machine{
+			{ID: "1", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "2", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "3", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "4", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+		}, nil
+	}
+
+	var client mock.FlapsClient
+	var destroyed int
+	client.ListFunc = func(ctx context.Context, state string) ([]*fly.Machine, error) { return listMachines() }
+	client.DestroyFunc = func(ctx context.Context, input fly.RemoveMachineInput, nonce string) error {
+		destroyed++
+		return nil
+	}
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r := fas.NewReconciler()
+	r.Client = &client
+	r.ScaleDownCooldown = cooldown
+	r.NowFunc = func() time.Time { return now }
+
+	// First reconcile: target matches current; sample the high watermark.
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "0", "4"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if destroyed != 0 {
+		t.Fatalf("expected no destroys on first reconcile, got %d", destroyed)
+	}
+
+	// Second reconcile, 1 minute later: demand drops, but the t=0 sample with
+	// maxCreated=4 is still in the 5m window → stabilizedMax=4 ≥ current=4,
+	// so no destroy.
+	now = now.Add(1 * time.Minute)
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "0", "2"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if destroyed != 0 {
+		t.Fatalf("expected destroy to be deferred within cooldown, got destroyed=%d", destroyed)
+	}
+
+	// Advance past the cooldown window. All prior samples age out, so the
+	// peak collapses to the latest raw max=2 and destroys fire.
+	now = now.Add(cooldown + 1*time.Second)
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "0", "2"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if destroyed != 2 {
+		t.Fatalf("expected 2 destroys after cooldown expired, got %d", destroyed)
+	}
+
+	// And scale-up remains immediate even with cooldown set: bump max back
+	// up to 5 and confirm a create fires without waiting.
+	// Reset destroy counter (already asserted) and stub Launch.
+	var created int
+	client.LaunchFunc = func(ctx context.Context, input fly.LaunchMachineInput) (*fly.Machine, error) {
+		created++
+		return &fly.Machine{ID: fmt.Sprintf("new-%d", created), Region: input.Region}, nil
+	}
+	// At this point the fleet still has 4 machines per listMachines; push
+	// target up to 5 to force a create.
+	now = now.Add(10 * time.Second)
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "5", "5"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if created == 0 {
+		t.Fatalf("expected immediate scale-up despite cooldown, got created=%d", created)
+	}
+}
+
+// In wildcard pool mode the same Reconciler is reused across apps, with
+// AppName rotated per work-queue item. Each app must keep its own cooldown
+// history; otherwise app A's recent peak can suppress app B's downscale.
+func TestReconciler_ScaleDownCooldown_MultiAppIsolation(t *testing.T) {
+	cooldown := 5 * time.Minute
+
+	machineConfig := &fly.MachineConfig{}
+	// Both apps report 4 started machines.
+	listFour := func(ctx context.Context, state string) ([]*fly.Machine, error) {
+		return []*fly.Machine{
+			{ID: "1", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "2", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "3", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+			{ID: "4", State: fly.MachineStateStarted, Region: "iad", HostStatus: fly.HostStatusOk, Config: machineConfig},
+		}, nil
+	}
+
+	var client mock.FlapsClient
+	var destroyedB int
+	client.ListFunc = listFour
+	client.DestroyFunc = func(ctx context.Context, input fly.RemoveMachineInput, nonce string) error {
+		destroyedB++
+		return nil
+	}
+
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	r := fas.NewReconciler()
+	r.Client = &client
+	r.ScaleDownCooldown = cooldown
+	r.NowFunc = func() time.Time { return now }
+
+	// App A reconciles with high demand → seeds its own history with peak=4.
+	r.AppName = "app-a"
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "0", "4"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// App B reconciles with low demand and a fleet of 4 → would-destroy 2.
+	// App A's peak must NOT defer App B's destroy.
+	r.AppName = "app-b"
+	r.MinCreatedMachineN, r.MaxCreatedMachineN = "0", "2"
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if destroyedB != 2 {
+		t.Fatalf("expected app-b destroys to fire independently of app-a peak, got destroyedB=%d", destroyedB)
+	}
 }
